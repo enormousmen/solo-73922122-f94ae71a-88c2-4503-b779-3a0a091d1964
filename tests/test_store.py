@@ -220,6 +220,92 @@ def test_switch_pool_rolls_back_when_write_fails(store: Store) -> None:
     assert store.renew(lease["lease_id"])["status"] == "active"
 
 
+# ---------------------------------------------------------------------------
+# Time is judged when a queued write can act, not when it arrived.
+# ---------------------------------------------------------------------------
+
+
+def test_renew_queued_past_expiry_does_not_resurrect_lease(
+    store: Store, clock
+) -> None:
+    lease, _ = store.acquire("client-a", ttl_seconds=60)
+    original_expiry = lease["expires_at"]
+
+    # Simulate the request queuing behind another writer: by the time the
+    # lease is renewed the deadline has passed.  Renew must report the normal
+    # expiry error and must not move the stored deadline.
+    clock.advance(61)
+    with pytest.raises(LeaseError) as exc:
+        store.renew(lease["lease_id"], ttl_seconds=3600)
+    assert exc.value.status_code == 409
+    assert exc.value.code == "lease_expired"
+
+    stored = store.get_lease(lease["lease_id"])
+    assert stored["status"] == "expired"
+    assert stored["expires_at"] == original_expiry
+    assert stored["seconds_remaining"] == 0
+
+
+def test_release_queued_past_expiry_reports_expired(store: Store, clock) -> None:
+    lease, _ = store.acquire("client-a", ttl_seconds=60)
+    original_expiry = lease["expires_at"]
+    clock.advance(61)
+    with pytest.raises(LeaseError) as exc:
+        store.release(lease["lease_id"])
+    assert exc.value.code == "lease_expired"
+    stored = store.get_lease(lease["lease_id"])
+    assert stored["status"] == "expired"
+    assert stored["expires_at"] == original_expiry
+
+
+def test_acquire_queued_past_expiry_reallocates_from_current_pool(
+    store: Store, clock
+) -> None:
+    """A stale leased address is not blindly handed back to the client."""
+    lease, _ = store.acquire("client-a", ttl_seconds=60)
+    assert lease["ip"] == "10.20.0.1"
+    # Another client holds the .2 address while our client is queued.
+    other, _ = store.acquire("client-b", ttl_seconds=60)
+    assert other["ip"] == "10.20.0.2"
+
+    clock.advance(61)
+    # Pool changed while the request was queued: the old address is no longer
+    # assignable, so the client gets a new lease from the new pool.
+    store.switch_pool("10.30.0.0/29")
+    fresh, reused = store.acquire("client-a")
+    assert reused is False
+    assert fresh["lease_id"] != lease["lease_id"]
+    assert fresh["ip"] == "10.30.0.1"
+    assert fresh["pool_cidr"] == "10.30.0.0/29"
+    assert store.get_lease(lease["lease_id"])["status"] == "expired"
+
+
+def test_acquire_reuses_lease_only_while_it_is_valid(store: Store, clock) -> None:
+    first, _ = store.acquire("client-a", ttl_seconds=60)
+    clock.advance(59)
+    same, reused = store.acquire("client-a")
+    assert reused is True and same["lease_id"] == first["lease_id"]
+    clock.advance(2)
+    fresh, reused = store.acquire("client-a")
+    assert reused is False
+    assert fresh["lease_id"] != first["lease_id"]
+
+
+def test_switch_counts_reflect_state_at_switch_time(store: Store, clock) -> None:
+    live, _ = store.acquire("live")
+    doomed, _ = store.acquire("doomed", ttl_seconds=60)
+    clock.advance(61)  # `doomed` expires before the switch is applied
+    result = store.switch_pool("10.30.0.0/29")
+    # Only the still-valid lease is occupied out of pool; the expired one was
+    # swept as part of the switch, at the instant the switch took effect.
+    assert result["occupied_out_of_pool"] == 1
+    assert {item["lease_id"] for item in store.out_of_pool_leases()} == {
+        live["lease_id"]
+    }
+    assert store.get_lease(doomed["lease_id"])["status"] == "expired"
+
+
+
 def test_reacquire_while_out_of_pool_returns_same_lease(store: Store) -> None:
     lease, _ = store.acquire("client-a")
     store.switch_pool("10.99.0.0/24")

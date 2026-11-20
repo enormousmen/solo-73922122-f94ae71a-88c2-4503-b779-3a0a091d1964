@@ -61,7 +61,9 @@ outside the pool — the client keeps its address until the lease ends.
 **Renew / release** are addressed by the current lease id. Release works for
 in-pool and out-of-pool addresses; renew is refused for an address outside
 the current pool (`409 address_out_of_pool`). Repeating a release is a
-successful no-op (`already_released: true`).
+successful no-op (`already_released: true`). If the deadline passes while the
+request is queued for the write lock, both operations answer
+`409 lease_expired`.
 
 **Pool switch** is a single transaction. Invalid CIDRs are rejected with 422
 and the previous pool keeps serving; any failure inside the transaction
@@ -73,7 +75,13 @@ or are released, and the operator report lists them with `expires_at`.
 **Expiry**: leases are swept to `release_reason: "expired"` at the start of
 each write transaction and are reported as `expired` once past their
 deadline even before a sweep. Expired rows stay in the table for auditing
-and `GET /v1/leases/{id}`.
+and `GET /v1/leases/{id}`. Time is judged **when a queued write can actually
+run**, i.e. after it obtains the write lock, not when the HTTP request
+arrived: a renew or release that waited behind other writers past the
+deadline fails with `409 lease_expired` and leaves the original `expires_at`
+untouched. Re-acquiring with the same `client_id` reuses a lease only while
+it is still valid at that instant; an expired one is retired and the client
+is allocated from the current pool and occupancy as they stand then.
 
 **Restart**: the pool is stored in the database's `settings` table; the
 environment default only seeds a fresh file. Relaunching the container
@@ -88,6 +96,15 @@ result as one of the two serial orders — never a half-switched state and
 never a lease issued from the old pool after the switch committed. The tests
 in `tests/test_concurrency.py` assert this equivalence over repeated races.
 
+Each command reads the clock only after acquiring the write lock, so a
+request that queued behind a long writer is evaluated at the instant it can
+mutate state. A switch's usage counters therefore describe the occupancy at
+the moment the switch takes effect. Reads use a deferred transaction that
+never takes the write lock, so queries keep answering while a write queues;
+the WAL snapshot is pinned before the clock is read, so the returned pool,
+lease status, `seconds_remaining` and `server_time` all describe the same
+committed state.
+
 ## Tests
 
 ```bash
@@ -98,4 +115,5 @@ python3 -m pytest -q
 - `tests/test_store.py` — allocation, idempotency, renew/release rules, expiry,
   pool moves, restart recovery
 - `tests/test_api.py` — HTTP status codes, structured errors, operator auth
-- `tests/test_concurrency.py` — switch-vs-operation races and address uniqueness
+- `tests/test_concurrency.py` — switch-vs-operation races, address uniqueness,
+  and queued-write expiry (renew/release/acquire that wait past the deadline)

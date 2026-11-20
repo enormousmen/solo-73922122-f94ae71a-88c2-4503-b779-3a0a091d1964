@@ -9,7 +9,19 @@ racing with acquire/renew/release always yields the state of some serial
 execution order of the two.
 
 Reads use a short deferred transaction so that multi-statement reports see
-one consistent snapshot even while a switch commits.
+one consistent snapshot even while a switch commits.  Reads never take the
+write lock, so a request queued behind a writer is still served, and the
+snapshot is pinned before the clock is read so the reported ``server_time``
+matches the committed state it is returned with.
+
+Time
+----
+Every command reads the clock *after* it holds the write lock.  A request
+that waited behind another writer therefore judges expiry at the instant it
+can actually mutate state, not at the instant it arrived: a renewal that
+queued while its lease expired fails with the normal expiry error instead of
+resurrecting the lease, and a pool switch computes its occupancy counters at
+the moment the switch takes effect.
 
 Expiry
 ------
@@ -31,11 +43,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from . import subnets
 from .config import Settings
 from .subnets import PoolError
+
+_T = TypeVar("_T")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -190,12 +204,18 @@ class Store:
             conn.close()
 
     @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
+    def _write(self) -> Iterator[tuple[sqlite3.Connection, float]]:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                yield conn
+                # Read the clock only after the write lock is held.  A request
+                # that waited behind another writer must judge expiry at the
+                # instant it can actually mutate state: using its arrival time
+                # would let a renewal resurrect a lease that expired while it
+                # was queued, and would make switch-time usage counts stale.
+                now = self.clock()
+                yield conn, now
             except BaseException:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
@@ -206,20 +226,33 @@ class Store:
                 conn.execute("ROLLBACK")
             conn.close()
 
-    @contextmanager
-    def _read(self) -> Iterator[sqlite3.Connection]:
+    def _read(self, body: Callable[[sqlite3.Connection, float], _T]) -> _T:
+        """Run ``body`` against one consistent ``(connection, now)`` snapshot.
+
+        The snapshot is pinned by a real table read *before* the clock is
+        taken.  WAL gives the whole read transaction one immutable view, and
+        ``server_time`` is therefore never older than the committed state
+        (pool, rows) it is returned alongside -- no matter whether a writer
+        commits just before, during or after the request.
+
+        The read transaction is deferred, so it takes no write lock and is
+        never queued behind an in-flight write.
+        """
         conn = self._connect()
         try:
             conn.execute("BEGIN")
             try:
-                yield conn
+                conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone()
+                now = self.clock()
+                result = body(conn, now)
+                conn.execute("COMMIT")
             except BaseException:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-            conn.execute("COMMIT")
+            return result
         finally:
-            if conn.in_transaction:  # pragma: no cover
+            if conn.in_transaction:  # pragma: no cover - commit failed
                 conn.execute("ROLLBACK")
             conn.close()
 
@@ -292,26 +325,30 @@ class Store:
     # ---------------------------------------------------------------- queries
 
     def pool_info(self) -> dict[str, Any]:
-        now = self.clock()
-        with self._read() as conn:
+        def body(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
             pool = self._current_pool(conn)
-            active = self._active_rows(conn, now)
-            counts = self._counts(pool, active)
-        return {
-            "cidr": str(pool),
-            "network_address": str(pool.network_address),
-            "broadcast_address": str(pool.broadcast_address),
-            "prefix_length": pool.prefixlen,
-            **counts,
-            "server_time": iso(now),
-        }
+            counts = self._counts(pool, self._active_rows(conn, now))
+            return {
+                "cidr": str(pool),
+                "network_address": str(pool.network_address),
+                "broadcast_address": str(pool.broadcast_address),
+                "prefix_length": pool.prefixlen,
+                **counts,
+                "server_time": iso(now),
+            }
+
+        return self._read(body)
 
     def get_lease(self, lease_id: str) -> dict[str, Any]:
-        now = self.clock()
-        with self._read() as conn:
+        def body(
+            conn: sqlite3.Connection, now: float
+        ) -> tuple[sqlite3.Row | None, float]:
             row = conn.execute(
                 "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
             ).fetchone()
+            return row, now
+
+        row, now = self._read(body)
         if row is None:
             raise LeaseError(404, "lease_not_found", "no lease with that id")
         return Lease.from_row(row).to_dict(now)
@@ -322,27 +359,25 @@ class Store:
         Expired-but-not-yet-swept leases are excluded here the same way a
         write transaction would have swept them.
         """
-        now = self.clock()
-        with self._read() as conn:
+
+        def body(conn: sqlite3.Connection, now: float) -> list[dict[str, Any]]:
             pool = self._current_pool(conn)
-            rows = [
-                row
-                for row in conn.execute(
-                    "SELECT * FROM leases WHERE released_at IS NULL"
-                ).fetchall()
-                if row["expires_at"] > now
-            ]
-        result = []
-        for row in rows:
-            if self._in_pool(pool, row["ip"]):
-                continue
-            lease = Lease.from_row(row)
-            item = lease.to_dict(now)
-            item["original_pool_cidr"] = lease.pool_cidr
-            item["current_pool_cidr"] = str(pool)
-            result.append(item)
-        result.sort(key=lambda item: (item["expires_at"], item["ip"]))
-        return result
+            result = []
+            for row in conn.execute(
+                "SELECT * FROM leases WHERE released_at IS NULL AND expires_at > ?",
+                (now,),
+            ).fetchall():
+                if self._in_pool(pool, row["ip"]):
+                    continue
+                lease = Lease.from_row(row)
+                item = lease.to_dict(now)
+                item["original_pool_cidr"] = lease.pool_cidr
+                item["current_pool_cidr"] = str(pool)
+                result.append(item)
+            result.sort(key=lambda item: (item["expires_at"], item["ip"]))
+            return result
+
+        return self._read(body)
 
     # --------------------------------------------------------------- commands
 
@@ -355,16 +390,19 @@ class Store:
         unexpired lease for the client was returned unchanged (even if its
         address has since fallen outside the pool).
         """
-        now = self.clock()
         ttl = self._resolve_ttl(ttl_seconds)
-        with self._write() as conn:
+        with self._write() as (conn, now):
             self._sweep_expired(conn, now)
             pool = self._current_pool(conn)
             existing = conn.execute(
                 "SELECT * FROM leases WHERE client_id = ? AND released_at IS NULL",
                 (client_id,),
             ).fetchone()
-            if existing is not None:
+            # Only a lease that is still live at this instant may be reused.
+            # If the client's lease expired while this request queued, the
+            # sweep above retired it and we fall through to allocating from
+            # the pool and occupancy as they stand now.
+            if existing is not None and Lease.from_row(existing).is_active(now):
                 return Lease.from_row(existing).to_dict(now), True
 
             held = {
@@ -400,9 +438,8 @@ class Store:
         return Lease.from_row(row).to_dict(now), False
 
     def renew(self, lease_id: str, ttl_seconds: int | None = None) -> dict[str, Any]:
-        now = self.clock()
         ttl = self._resolve_ttl(ttl_seconds)
-        with self._write() as conn:
+        with self._write() as (conn, now):
             self._sweep_expired(conn, now)
             pool = self._current_pool(conn)
             row = conn.execute(
@@ -415,6 +452,12 @@ class Store:
                 if lease.release_reason == "expired":
                     raise LeaseError(409, "lease_expired", "lease has expired")
                 raise LeaseError(409, "lease_released", "lease has already been released")
+            # The lease may have run out while this request waited for the
+            # write lock even if the sweep saw nothing else to do.  Never
+            # extend an expired lease, and never move its original deadline:
+            # the expiry error carries the stored expires_at unchanged.
+            if lease.expires_at <= now:
+                raise LeaseError(409, "lease_expired", "lease has expired")
             if not self._in_pool(pool, lease.ip):
                 raise LeaseError(
                     409,
@@ -432,9 +475,13 @@ class Store:
         return Lease.from_row(row).to_dict(now)
 
     def release(self, lease_id: str) -> tuple[dict[str, Any], bool]:
-        """Release an active lease.  Releasing an already released lease is a no-op."""
-        now = self.clock()
-        with self._write() as conn:
+        """Release an active lease.  Releasing an already released lease is a no-op.
+
+        If the lease expired while this request queued behind the write lock,
+        the answer is the existing expiry error and the stored deadline is
+        left untouched.
+        """
+        with self._write() as (conn, now):
             self._sweep_expired(conn, now)
             row = conn.execute(
                 "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
@@ -443,6 +490,8 @@ class Store:
                 raise LeaseError(404, "lease_not_found", "no lease with that id")
             lease = Lease.from_row(row)
             if lease.released_at is None:
+                if lease.expires_at <= now:
+                    raise LeaseError(409, "lease_expired", "lease has expired")
                 conn.execute(
                     """
                     UPDATE leases SET released_at = ?, release_reason = 'released'
@@ -464,8 +513,7 @@ class Store:
             target = subnets.parse_pool_cidr(cidr)
         except PoolError as exc:
             raise LeaseError(422, "invalid_pool", str(exc)) from exc
-        now = self.clock()
-        with self._write() as conn:
+        with self._write() as (conn, now):
             self._sweep_expired(conn, now)
             previous = self._current_pool(conn)
             if previous == target:

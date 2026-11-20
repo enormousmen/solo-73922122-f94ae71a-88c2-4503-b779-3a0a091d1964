@@ -19,10 +19,12 @@ Single-subnet IPv4 DHCP-style lease API.
 
 * **Acquire** (`POST /v1/leases`) hands out the lowest free address of the
   current pool.  Re-acquiring with the same `client_id` returns the client's
-  unexpired lease unchanged (HTTP 200, `reused: true`).
+  still-valid lease unchanged (HTTP 200, `reused: true`); an expired lease is
+  never reused.
 * **Renew / release** (`POST /v1/leases/{lease_id}/renew|release`) require the
   current lease id.  An address that fell outside the current pool can be
-  released but not renewed.
+  released but not renewed.  A request that queued past the lease deadline
+  fails with `409 lease_expired` and does not change the stored deadline.
 * **Pool switch** (`PUT /v1/pool`) is atomic: it either fully commits or the
   previous pool keeps serving.  The pool and all leases survive restarts.
 * **Operators** (`GET /v1/admin/out-of-pool`) can list still-occupied

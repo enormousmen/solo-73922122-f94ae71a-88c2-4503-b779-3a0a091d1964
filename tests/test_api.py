@@ -93,6 +93,44 @@ def test_same_pool_switch_is_noop(client: TestClient) -> None:
     assert response.json()["changed"] is False
 
 
+def test_renew_and_release_after_expiry_return_lease_expired(
+    client: TestClient, clock
+) -> None:
+    lease = client.post(
+        "/v1/leases", json={"client_id": "a", "ttl_seconds": 60}
+    ).json()
+    expires_at = lease["expires_at"]
+    clock.advance(61)
+
+    before = client.get(f"/v1/leases/{lease['lease_id']}").json()
+    assert before["status"] == "expired"
+    assert before["expires_at"] == expires_at
+    assert before["seconds_remaining"] == 0
+
+    renew = client.post(f"/v1/leases/{lease['lease_id']}/renew")
+    assert renew.status_code == 409
+    assert renew.json()["error"]["code"] == "lease_expired"
+    release = client.post(f"/v1/leases/{lease['lease_id']}/release")
+    assert release.status_code == 409
+    assert release.json()["error"]["code"] == "lease_expired"
+
+    after = client.get(f"/v1/leases/{lease['lease_id']}").json()
+    assert after["status"] == "expired"
+    assert after["expires_at"] == expires_at  # original deadline preserved
+
+    again = client.post("/v1/leases", json={"client_id": "a"})
+    assert again.status_code == 201
+    assert again.json()["lease_id"] != lease["lease_id"]
+
+
+def test_server_time_and_pool_view_are_consistent(client: TestClient) -> None:
+    lease = client.post("/v1/leases", json={"client_id": "a"}).json()
+    info = client.get("/v1/pool").json()
+    assert info["server_time"] >= lease["issued_at"]
+    assert info["allocated_in_pool"] == 1
+    assert info["free_in_pool"] == info["usable_addresses"] - 1
+
+
 def test_operator_token_enforced(tmp_path) -> None:
     from app.config import Settings
     from app.db import Store
