@@ -1,0 +1,31 @@
+services:
+  lease-api:
+    build: .
+    image: branch-gateway-lease-api:local
+    container_name: branch-gateway-lease-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DB_PATH: /data/leases.db
+      DEFAULT_POOL_CIDR: "${DEFAULT_POOL_CIDR:-10.20.0.0/24}"
+      DEFAULT_TTL_SECONDS: "${DEFAULT_TTL_SECONDS:-3600}"
+      MIN_TTL_SECONDS: "${MIN_TTL_SECONDS:-60}"
+      MAX_TTL_SECONDS: "${MAX_TTL_SECONDS:-604800}"
+      # Empty means the demo is open; set a value to require X-Operator-Token.
+      OPERATOR_TOKEN: "${OPERATOR_TOKEN:-}"
+    volumes:
+      - lease-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  lease-data:
